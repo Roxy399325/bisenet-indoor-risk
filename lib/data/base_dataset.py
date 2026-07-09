@@ -30,7 +30,11 @@ class BaseDataset(Dataset):
             pairs = fr.read().splitlines()
         self.img_paths, self.lb_paths = [], []
         for pair in pairs:
-            imgpth, lbpth = pair.split(',')
+            if ',' in pair:
+                imgpth, lbpth = pair.split(',', 1)
+            else:
+                imgpth, lbpth = pair.split()
+            imgpth, lbpth = imgpth.strip(), lbpth.strip()
             self.img_paths.append(osp.join(dataroot, imgpth))
             self.lb_paths.append(osp.join(dataroot, lbpth))
 

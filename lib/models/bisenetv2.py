@@ -1,4 +1,5 @@
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -376,6 +377,8 @@ class BiSeNetV2(nn.Module):
 
 
     def load_pretrain(self):
+        if os.environ.get('BISENET_SKIP_BACKBONE_PRETRAIN') == '1':
+            return
         state = modelzoo.load_url(backbone_url)
         for name, child in self.named_children():
             if name in state.keys():

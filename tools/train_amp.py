@@ -51,15 +51,61 @@ args = parse_args()
 cfg = set_cfg_from_file(args.config)
 
 
+def get_finetune_from():
+    finetune_from = args.finetune_from or cfg.get('finetune_from')
+    if finetune_from in (None, ''):
+        return None
+    return finetune_from
+
+
+def get_state_dict(weight_path):
+    state = torch.load(weight_path, map_location='cpu')
+    if isinstance(state, dict):
+        for key in ('state_dict', 'model', 'model_state', 'model_state_dict', 'net'):
+            if key in state and isinstance(state[key], dict):
+                state = state[key]
+                break
+    return {
+        k[7:] if k.startswith('module.') else k: v
+        for k, v in state.items()
+    }
+
+
+def load_matched_weights(net, weight_path):
+    logger = logging.getLogger()
+    state = get_state_dict(weight_path)
+    model_state = net.state_dict()
+    matched_state = {}
+    unexpected_keys = []
+    skipped_keys = []
+
+    for key, val in state.items():
+        if key not in model_state:
+            unexpected_keys.append(key)
+        elif model_state[key].shape != val.shape:
+            skipped_keys.append(
+                f'{key}: checkpoint {tuple(val.shape)} != model {tuple(model_state[key].shape)}')
+        else:
+            matched_state[key] = val
+
+    msg = net.load_state_dict(matched_state, strict=False)
+    logger.info(f'\tloaded keys: {len(matched_state)}')
+    logger.info('\tmissing keys: ' + json.dumps(msg.missing_keys))
+    logger.info('\tunexpected keys: ' + json.dumps(unexpected_keys))
+    logger.info('\tskipped size-mismatch keys: ' + json.dumps(skipped_keys))
+
+
 def set_model(lb_ignore=255):
     logger = logging.getLogger()
+    finetune_from = get_finetune_from()
+    if not finetune_from is None:
+        if not osp.isfile(finetune_from):
+            raise FileNotFoundError(f'pretrained weight not found: {finetune_from}')
+        os.environ['BISENET_SKIP_BACKBONE_PRETRAIN'] = '1'
     net = model_factory[cfg.model_type](cfg.n_cats)
-    if not args.finetune_from is None:
-        logger.info(f'load pretrained weights from {args.finetune_from}')
-        msg = net.load_state_dict(torch.load(args.finetune_from,
-            map_location='cpu'), strict=False)
-        logger.info('\tmissing keys: ' + json.dumps(msg.missing_keys))
-        logger.info('\tunexpected keys: ' + json.dumps(msg.unexpected_keys))
+    if not finetune_from is None:
+        logger.info(f'load pretrained weights from {finetune_from}')
+        load_matched_weights(net, finetune_from)
     if cfg.use_sync_bn: net = nn.SyncBatchNorm.convert_sync_batchnorm(net)
     net.cuda()
     net.train()

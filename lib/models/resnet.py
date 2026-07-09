@@ -1,6 +1,7 @@
 #!/usr/bin/python
 # -*- encoding: utf-8 -*-
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,6 +85,8 @@ class Resnet18(nn.Module):
         return feat8, feat16, feat32
 
     def init_weight(self):
+        if os.environ.get('BISENET_SKIP_BACKBONE_PRETRAIN') == '1':
+            return
         state_dict = modelzoo.load_url(resnet18_url)
         self_state_dict = self.state_dict()
         for k, v in state_dict.items():
