@@ -19,33 +19,21 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Match the other command-line tools so this script runs from the project root.
-sys.path.insert(0, '.')
+PROJECT_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 import lib.data.transform_cv2 as T
 from configs import set_cfg_from_file
 from lib.models import model_factory
-from lib.risk.bisenet_features import analyze_bisenet, render_analysis_overlay
+from lib.risk.bisenet_features import (
+    CLASS_COLORS,
+    CLASS_NAMES,
+    analyze_bisenet,
+    render_analysis_overlay,
+)
 
 
-# BGR colors, so they can be written directly by OpenCV.
-CLASS_COLORS = np.array([
-    (75, 180, 70),    # walkable_surface
-    (210, 120, 60),   # wall_boundary
-    (95, 95, 95),     # non_walkable
-    (55, 55, 220),    # obstacle
-    (50, 220, 240),   # slippery_surface
-    (35, 140, 255),   # step_threshold
-], dtype=np.uint8)
-
-DEFAULT_CLASS_NAMES = [
-    'walkable_surface',
-    'wall_boundary',
-    'non_walkable',
-    'obstacle',
-    'slippery_surface',
-    'step_threshold',
-]
+DEFAULT_CLASS_NAMES = list(CLASS_NAMES)
 
 INDOOR_RISK_MEAN = (0.52594033, 0.46734318, 0.41189465)
 INDOOR_RISK_STD = (0.24811083, 0.24959911, 0.25970083)
@@ -53,9 +41,18 @@ INDOOR_RISK_STD = (0.24811083, 0.24959911, 0.25970083)
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', default='configs/bisenetv2_indoor_risk.py')
-    parser.add_argument('--weight-path', default='res_indoor_risk_v2/model_final.pth')
-    parser.add_argument('--img-path', help='Image to segment. Defaults to a validation image.')
+    parser.add_argument(
+        '--config',
+        default=osp.join(PROJECT_ROOT, 'configs', 'bisenetv2_indoor_risk.py'),
+    )
+    parser.add_argument(
+        '--weight-path',
+        default=osp.join(PROJECT_ROOT, 'res_indoor_risk_v2', 'model_final.pth'),
+    )
+    parser.add_argument(
+        '--img-path', '--image-path', dest='img_path',
+        help='Image to segment. Defaults to a validation image.',
+    )
     parser.add_argument('--label-path', help='Optional grayscale ground-truth mask.')
     parser.add_argument('--sample-index', type=int, default=0,
                         help='Validation image index when --img-path is omitted.')
@@ -64,6 +61,14 @@ def parse_args():
     parser.add_argument('--features-output', help='JSON feature and risk output path.')
     parser.add_argument('--analysis-output', help='Risk overlay output path.')
     return parser.parse_args()
+
+
+def resolve_project_path(path):
+    if osp.isabs(path):
+        return path
+    if osp.exists(path):
+        return osp.abspath(path)
+    return osp.join(PROJECT_ROOT, path)
 
 
 def read_validation_pair(cfg, sample_index):
@@ -177,7 +182,11 @@ def print_single_image_metrics(prediction, label, class_names, n_classes):
 
 def main():
     args = parse_args()
-    cfg = set_cfg_from_file(args.config)
+    cfg = set_cfg_from_file(resolve_project_path(args.config))
+    for field in ('im_root', 'train_im_anns', 'val_im_anns', 'respth'):
+        value = getattr(cfg, field, None)
+        if value:
+            setattr(cfg, field, resolve_project_path(value))
 
     if args.img_path is None:
         img_path, default_label_path = read_validation_pair(cfg, args.sample_index)
@@ -202,8 +211,20 @@ def main():
     os.environ.setdefault('BISENET_SKIP_BACKBONE_PRETRAIN', '1')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     net = model_factory[cfg.model_type](cfg.n_cats, aux_mode='eval')
-    state_dict = torch.load(args.weight_path, map_location='cpu', weights_only=True)
-    net.load_state_dict(state_dict, strict=False)
+    weight_path = resolve_project_path(args.weight_path)
+    state_dict = torch.load(weight_path, map_location='cpu', weights_only=True)
+    load_result = net.load_state_dict(state_dict, strict=False)
+    expected_aux_prefixes = ('aux2.', 'aux3.', 'aux4.', 'aux5_4.')
+    unexpected = [
+        key for key in load_result.unexpected_keys
+        if not key.startswith(expected_aux_prefixes)
+    ]
+    if load_result.missing_keys or unexpected:
+        raise RuntimeError(
+            'Checkpoint is incompatible. missing_keys={}, unexpected_keys={}'.format(
+                load_result.missing_keys, unexpected
+            )
+        )
     net.eval().to(device)
 
     to_tensor = T.ToTensor(mean=INDOOR_RISK_MEAN, std=INDOOR_RISK_STD)
@@ -213,7 +234,9 @@ def main():
     padded_size = tuple(math.ceil(size / 32) * 32 for size in original_size)
 
     with torch.no_grad():
-        tensor = F.interpolate(tensor, size=padded_size, mode='bilinear', align_corners=False)
+        pad_height = padded_size[0] - original_size[0]
+        pad_width = padded_size[1] - original_size[1]
+        tensor = F.pad(tensor, (0, pad_width, 0, pad_height), value=0.0)
         if device.type == 'cuda':
             torch.cuda.synchronize()
         start = time.perf_counter()
@@ -221,7 +244,8 @@ def main():
         if device.type == 'cuda':
             torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logits = F.interpolate(logits, size=original_size, mode='bilinear', align_corners=False)
+        logits = F.interpolate(logits, size=padded_size, mode='bilinear', align_corners=False)
+        logits = logits[:, :, :original_size[0], :original_size[1]]
         prediction = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
 
     class_names = load_class_names(cfg.im_root, cfg.n_cats)

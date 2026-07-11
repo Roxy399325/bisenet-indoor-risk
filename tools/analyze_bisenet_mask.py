@@ -14,7 +14,8 @@ import sys
 
 import cv2
 
-sys.path.insert(0, '.')
+PROJECT_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from lib.risk.bisenet_features import analyze_bisenet, render_analysis_overlay
 
@@ -23,7 +24,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', required=True, help='Original BGR image path.')
     parser.add_argument('--mask', required=True, help='Single-channel class-id mask path.')
-    parser.add_argument('--output-dir', default='res_indoor_risk_v2/analysis')
+    parser.add_argument(
+        '--output-dir',
+        default=osp.join(PROJECT_ROOT, 'res_indoor_risk_v2', 'analysis'),
+    )
     parser.add_argument('--prefix', help='Output filename prefix; defaults to image stem.')
     return parser.parse_args()
 

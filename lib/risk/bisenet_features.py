@@ -174,6 +174,19 @@ def _components(binary: np.ndarray, min_area: int) -> List[Dict[str, Any]]:
         box_width = int(stats[label, cv2.CC_STAT_WIDTH])
         box_height = int(stats[label, cv2.CC_STAT_HEIGHT])
         component_mask = labels == label
+        contours, _ = cv2.findContours(
+            component_mask.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        contour_points: List[List[int]] = []
+        if contours:
+            contour = max(contours, key=cv2.contourArea)
+            epsilon = max(1.0, 0.005 * cv2.arcLength(contour, True))
+            contour = cv2.approxPolyDP(contour, epsilon, True)
+            contour_points = [
+                [int(point[0][0]), int(point[0][1])] for point in contour
+            ]
         components.append(
             {
                 "id": int(len(components) + 1),
@@ -187,9 +200,47 @@ def _components(binary: np.ndarray, min_area: int) -> List[Dict[str, Any]]:
                 "bottom_frame_ratio": float(
                     component_mask[int(height * 0.8) :, :].sum() / float(area)
                 ),
+                "contour": contour_points,
             }
         )
     return components
+
+
+def _annotate_corridor_overlap(
+    components: List[Dict[str, Any]],
+    corridor: np.ndarray,
+    corridor_valid: bool,
+) -> int:
+    """Attach per-region corridor overlap and return the in-corridor count."""
+
+    in_corridor_count = 0
+    for component in components:
+        if not corridor_valid:
+            component["corridor_overlap_px"] = None
+            component["corridor_overlap_ratio"] = None
+            component["in_corridor"] = None
+            continue
+
+        x, y, box_width, box_height = component["bbox"]
+        local_mask = np.zeros((box_height, box_width), dtype=np.uint8)
+        contour = np.asarray(component["contour"], dtype=np.int32)
+        if contour.size:
+            contour = contour - np.array([x, y], dtype=np.int32)
+            cv2.fillPoly(local_mask, [contour], 1)
+        overlap = int(
+            np.count_nonzero(
+                local_mask.astype(bool)
+                & corridor[y : y + box_height, x : x + box_width]
+            )
+        )
+        overlap_ratio = overlap / float(max(int(component["area_px"]), 1))
+        in_corridor = overlap >= max(4, int(round(component["area_px"] * 0.05)))
+        component["corridor_overlap_px"] = overlap
+        component["corridor_overlap_ratio"] = float(overlap_ratio)
+        component["in_corridor"] = bool(in_corridor)
+        if in_corridor:
+            in_corridor_count += 1
+    return in_corridor_count
 
 
 def _row_intervals(row: np.ndarray) -> List[Tuple[int, int]]:
@@ -213,52 +264,82 @@ def _central_interval(
     )
 
 
-def _build_corridor(candidate: np.ndarray) -> Tuple[np.ndarray, bool, bool]:
-    """Trace a central, bottom-connected corridor through candidate pixels."""
-
-    height, width = candidate.shape
-    corridor = np.zeros_like(candidate, dtype=bool)
-    bottom_band_start = max(0, int(height * 0.90))
-    seed: Optional[Tuple[int, int]] = None
-    center_x = width / 2.0
-
-    for y in range(height - 1, bottom_band_start - 1, -1):
-        interval = _central_interval(_row_intervals(candidate[y]), center_x)
-        if interval is not None:
-            x = int(round((interval[0] + interval[1]) / 2.0))
-            seed = (min(max(x, 0), width - 1), y)
-            break
-
-    if seed is not None:
-        _, labels, _, _ = cv2.connectedComponentsWithStats(
-            candidate.astype(np.uint8), 8
-        )
-        component_label = int(labels[seed[1], seed[0]])
-        if component_label > 0:
-            component = labels == component_label
-            previous_center = center_x
-            for y in range(height - 1, max(-1, int(height * 0.35)) - 1, -1):
-                interval = _central_interval(_row_intervals(component[y]), previous_center)
-                if interval is None:
-                    continue
-                corridor[y, interval[0] : interval[1] + 1] = True
-                previous_center = (interval[0] + interval[1]) / 2.0
-            if int(corridor.sum()) > 0:
-                return corridor, True, False
+def _perspective_envelope(height: int, width: int) -> np.ndarray:
+    """Return the default 20%-top/60%-bottom perspective corridor."""
 
     polygon = np.array(
         [
-            [int(width * 0.20), int(height * 0.35)],
-            [int(width * 0.80), int(height * 0.35)],
+            [int(width * 0.40), int(height * 0.35)],
+            [int(width * 0.60), int(height * 0.35)],
             [int(width * 0.80), height - 1],
             [int(width * 0.20), height - 1],
         ],
         dtype=np.int32,
     )
-    fallback = np.zeros_like(candidate, dtype=np.uint8)
-    cv2.fillPoly(fallback, [polygon], 1)
-    corridor = fallback.astype(bool) & candidate
-    return corridor, bool(int(corridor.sum()) > 0), True
+    envelope = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(envelope, [polygon], 1)
+    return envelope.astype(bool)
+
+
+def _build_corridor(
+    walkable: np.ndarray,
+    candidate: np.ndarray,
+) -> Tuple[np.ndarray, bool, bool]:
+    """Build a perspective-limited corridor from bottom-centre walkable pixels."""
+
+    height, width = candidate.shape
+    default_envelope = _perspective_envelope(height, width)
+    fallback = default_envelope & candidate
+    bottom_band_start = max(0, int(height * 0.90))
+    seed: Optional[Tuple[int, int]] = None
+    center_x = width / 2.0
+    center_left = int(width * 0.40)
+    center_right = max(center_left + 1, int(width * 0.60))
+
+    for y in range(height - 1, bottom_band_start - 1, -1):
+        center_pixels = np.flatnonzero(walkable[y, center_left:center_right])
+        if center_pixels.size:
+            xs = center_pixels + center_left
+            x = int(xs[np.argmin(np.abs(xs - center_x))])
+            seed = (x, y)
+            break
+
+    if seed is None:
+        return fallback, False, True
+
+    _, labels, _, _ = cv2.connectedComponentsWithStats(
+        walkable.astype(np.uint8), 8
+    )
+    component_label = int(labels[seed[1], seed[0]])
+    if component_label <= 0:
+        return fallback, False, True
+
+    component = labels == component_label
+    corridor = np.zeros_like(candidate, dtype=bool)
+    previous_center = center_x
+    top_y = int(height * 0.35)
+    rows_with_candidate = 0
+    for y in range(height - 1, top_y - 1, -1):
+        interval = _central_interval(_row_intervals(component[y]), previous_center)
+        if interval is not None:
+            observed_center = (interval[0] + interval[1]) / 2.0
+            previous_center = 0.75 * previous_center + 0.25 * observed_center
+
+        progress = (y - top_y) / float(max(height - 1 - top_y, 1))
+        corridor_width = width * (0.20 + 0.40 * progress)
+        left = max(0, int(round(previous_center - corridor_width / 2.0)))
+        right = min(width, int(round(previous_center + corridor_width / 2.0)))
+        if right > left:
+            corridor[y, left:right] = candidate[y, left:right]
+            if np.any(corridor[y]):
+                rows_with_candidate += 1
+
+    bottom_contact = bool(
+        np.any(corridor[bottom_band_start:, center_left:center_right])
+    )
+    row_coverage = rows_with_candidate / float(max(height - top_y, 1))
+    corridor_valid = bottom_contact and row_coverage >= 0.25
+    return corridor, bool(corridor_valid), False
 
 
 def _max_run_length(row: np.ndarray) -> int:
@@ -266,23 +347,28 @@ def _max_run_length(row: np.ndarray) -> int:
     return max((end - start + 1 for start, end in intervals), default=0)
 
 
-def _low_light_features(image: np.ndarray) -> Dict[str, Any]:
+def _low_light_features(
+    image: np.ndarray,
+    roi: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    mean_gray = float(gray.mean())
-    p10_gray = float(np.percentile(gray, 10))
-    score = float(
-        np.clip(
-            0.60 * (1.0 - mean_gray / 255.0)
-            + 0.40 * (1.0 - p10_gray / 255.0),
-            0.0,
-            1.0,
-        )
-    )
+    if roi is None or roi.shape != gray.shape or int(np.count_nonzero(roi)) < 64:
+        roi = np.zeros(gray.shape, dtype=bool)
+        roi[int(gray.shape[0] * 0.40) :, :] = True
+    pixels = gray[roi]
+    mean_gray = float(pixels.mean())
+    p10_gray = float(np.percentile(pixels, 10))
+    dark_pixel_ratio = float(np.mean(pixels < 50))
+    mean_risk = _clip01((100.0 - mean_gray) / 70.0)
+    dark_area_risk = _clip01((dark_pixel_ratio - 0.15) / 0.50)
+    score = float(0.70 * mean_risk + 0.30 * dark_area_risk)
     return {
         "gray_mean": mean_gray,
         "gray_p10": p10_gray,
+        "low_light_dark_pixel_ratio": dark_pixel_ratio,
+        "low_light_roi_ratio": float(np.count_nonzero(roi) / roi.size),
         "low_light_score": score,
-        "low_light_flag": bool(mean_gray < 60.0 or p10_gray < 25.0),
+        "low_light_flag": bool(score >= 0.50),
     }
 
 
@@ -333,6 +419,13 @@ def _score_risk(features: Dict[str, Any], mask_valid: bool) -> RiskResult:
         "slippery_surface": slippery_score,
         "low_light": low_light_score,
     }
+    raw_score = float(sum(component_scores.values()))
+    observability_penalty = (
+        max(0.0, 25.0 - raw_score)
+        if not corridor_valid or not mask_valid
+        else 0.0
+    )
+    component_scores["observability_penalty"] = observability_penalty
     score = float(round(sum(component_scores.values()), 2))
     reasons: List[str] = []
     suggestions: List[str] = []
@@ -355,15 +448,11 @@ def _score_risk(features: Dict[str, Any], mask_valid: bool) -> RiskResult:
         reasons.append("图像存在低光照风险。")
         suggestions.append("增加室内照明或配置夜间感应灯。")
     if not corridor_valid:
-        # A missing/invalid corridor is an observability failure, not proof
-        # that the scene is safe. Keep the result out of the low-risk bucket.
-        score = max(score, 25.0)
         reasons.append("无法可靠识别底部中心通道，当前风险结果可信度有限。")
         suggestions.append("重新采集图像或调整摄像头视角，确保地面和底部中心区域可见。")
 
     if not mask_valid:
-        score = max(score, 25.0)
-        reasons.append("有效分割像素不足，无法完成可靠环境判断。")
+        reasons.append("有效分割像素比例不足，无法完成可靠环境判断。")
         suggestions.append("检查模型输出和输入图像，重新进行分割。")
 
     level = _risk_level(score)
@@ -386,6 +475,7 @@ def analyze_bisenet(
     mask: np.ndarray,
     *,
     min_component_area: Optional[int] = None,
+    min_valid_pixel_ratio: float = 0.80,
 ) -> BisenetAnalysis:
     """Extract features and calculate rule-based risk from a class-id mask."""
 
@@ -394,19 +484,30 @@ def analyze_bisenet(
     min_area = int(min_component_area or _minimum_component_area(height, width))
     valid = mask != IGNORE_ID
     valid_count = int(valid.sum())
-    mask_valid = valid_count > 0
+    valid_pixel_ratio = float(valid_count / float(height * width))
+    mask_valid = valid_count > 0 and valid_pixel_ratio >= min_valid_pixel_ratio
     denominator = float(max(valid_count, 1))
 
     class_masks = {
         class_id: _clean_class_mask(mask, class_id, min_area)
         for class_id in range(len(CLASS_NAMES))
     }
-    cleaned_mask = mask.copy()
+    cleaned_mask = np.full(mask.shape, IGNORE_ID, dtype=np.uint8)
+    # Later assignments have higher priority when morphology creates overlap.
+    for class_id in (
+        CLASS_IDS["non_walkable"],
+        CLASS_IDS["wall_boundary"],
+        CLASS_IDS["walkable_surface"],
+        CLASS_IDS["obstacle"],
+        CLASS_IDS["slippery_surface"],
+        CLASS_IDS["step_threshold"],
+    ):
+        cleaned_mask[class_masks[class_id]] = class_id
 
     # Preserve original categorical pixels for ratios. Cleaned masks are used
     # for components and geometry so one-pixel noise does not become a hazard.
     features: Dict[str, Any] = {
-        "valid_pixel_ratio": float(valid_count / float(height * width)),
+        "valid_pixel_ratio": valid_pixel_ratio,
     }
     for class_name, class_id in CLASS_IDS.items():
         pixel_count = int(np.count_nonzero((mask == class_id) & valid))
@@ -421,6 +522,7 @@ def analyze_bisenet(
     features.update(
         {
             "obstacle_count": int(len(obstacle_components)),
+            "obstacle_region_count": int(len(obstacle_components)),
             "largest_obstacle_ratio": float(
                 max((item["area_ratio"] for item in obstacle_components), default=0.0)
             ),
@@ -434,44 +536,56 @@ def analyze_bisenet(
     candidate = np.zeros_like(mask, dtype=bool)
     for class_id in _DANGER_CLASSES:
         candidate |= class_masks[class_id]
-    corridor_mask, corridor_valid, corridor_fallback = _build_corridor(candidate)
+    corridor_mask, corridor_valid, corridor_fallback = _build_corridor(
+        class_masks[CLASS_IDS["walkable_surface"]],
+        candidate,
+    )
     corridor_pixels = int(corridor_mask.sum())
     corridor_denominator = float(max(corridor_pixels, 1))
     corridor_obstacle_mask = obstacle_mask & corridor_mask
-    corridor_obstacle_components = _components(corridor_obstacle_mask, min_area)
-    corridor_obstacle_count = len(corridor_obstacle_components)
+    corridor_obstacle_count = _annotate_corridor_overlap(
+        obstacle_components,
+        corridor_mask,
+        corridor_valid,
+    )
     full_obstacle_pixels = int(obstacle_mask.sum())
 
     features.update(
         {
             "corridor_valid": bool(corridor_valid),
             "corridor_fallback_used": bool(corridor_fallback),
-            "corridor_area_ratio": float(corridor_pixels / denominator),
-            "corridor_obstacle_count": int(corridor_obstacle_count),
+            "corridor_area_ratio": float(corridor_pixels / denominator)
+            if corridor_valid
+            else None,
+            "corridor_obstacle_count": int(corridor_obstacle_count)
+            if corridor_valid
+            else None,
             "corridor_obstacle_occupancy": float(
                 corridor_obstacle_mask.sum() / corridor_denominator
             )
             if corridor_valid
-            else 0.0,
+            else None,
             "corridor_slippery_ratio": float(
                 (class_masks[CLASS_IDS["slippery_surface"]] & corridor_mask).sum()
                 / corridor_denominator
             )
             if corridor_valid
-            else 0.0,
+            else None,
             "corridor_step_ratio": float(
                 (class_masks[CLASS_IDS["step_threshold"]] & corridor_mask).sum()
                 / corridor_denominator
             )
             if corridor_valid
-            else 0.0,
+            else None,
             "obstacle_channel_overlap_ratio": float(
                 corridor_obstacle_mask.sum() / float(max(full_obstacle_pixels, 1))
-            ),
+            )
+            if corridor_valid
+            else None,
         }
     )
     global_slippery_ratio = float(features["slippery_surface_area_ratio"])
-    corridor_slippery_ratio = float(features["corridor_slippery_ratio"])
+    corridor_slippery_ratio = float(features["corridor_slippery_ratio"] or 0.0)
     features["slippery_surface_score"] = float(
         0.40 * _clip01(global_slippery_ratio / 0.25)
         + 0.60 * _clip01(corridor_slippery_ratio / 0.25)
@@ -483,12 +597,13 @@ def analyze_bisenet(
     features["step_threshold_count"] = int(len(step_components))
 
     passage_widths: List[int] = []
-    for y in range(int(height * 0.35), height):
-        width_px = _max_run_length(
-            corridor_mask[y] & class_masks[CLASS_IDS["walkable_surface"]][y]
-        )
-        if width_px >= 2:
-            passage_widths.append(width_px)
+    if corridor_valid:
+        for y in range(int(height * 0.35), height):
+            width_px = _max_run_length(
+                corridor_mask[y] & class_masks[CLASS_IDS["walkable_surface"]][y]
+            )
+            if width_px >= 2:
+                passage_widths.append(width_px)
     if passage_widths:
         narrowest_px = int(round(float(np.percentile(passage_widths, 5))))
         features["narrowest_passage_width_px"] = narrowest_px
@@ -497,17 +612,22 @@ def analyze_bisenet(
         features["narrowest_passage_width_px"] = None
         features["narrowest_passage_width_ratio"] = None
 
-    features.update(_low_light_features(image))
+    light_roi = corridor_mask if corridor_valid else None
+    features.update(_low_light_features(image, light_roi))
     risk = _score_risk(features, mask_valid)
 
     quality = {
         "valid_pixel_ratio": features["valid_pixel_ratio"],
+        "min_valid_pixel_ratio": float(min_valid_pixel_ratio),
+        "mask_valid": bool(mask_valid),
         "min_component_area_px": int(min_area),
         "corridor_valid": bool(corridor_valid),
         "corridor_fallback_used": bool(corridor_fallback),
         "step_threshold_reliability": "low",
         "slippery_surface_reliability": "medium",
         "specific_obstacle_categories_available": False,
+        "obstacle_count_semantics": "connected_regions_not_object_instances",
+        "low_light_method": "corridor_or_lower_frame_heuristic",
         "absolute_metric_scale_available": False,
     }
     available = [
@@ -520,6 +640,9 @@ def analyze_bisenet(
         "narrowest_passage_width_m",
         "specific_obstacle_categories",
     ]
+    unavailable.extend(
+        key for key, value in features.items() if value is None and key not in unavailable
+    )
     return BisenetAnalysis(
         image_size=(height, width),
         mask_valid=mask_valid,
