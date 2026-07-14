@@ -7,6 +7,7 @@ from .bisenet_features import (
     analyze_bisenet,
     render_analysis_overlay,
 )
+from .yolo import UltralyticsYoloAdapter, YoloDetection
 
 __all__ = [
     "BisenetAnalysis",
@@ -14,4 +15,6 @@ __all__ = [
     "CLASS_IDS",
     "analyze_bisenet",
     "render_analysis_overlay",
+    "UltralyticsYoloAdapter",
+    "YoloDetection",
 ]

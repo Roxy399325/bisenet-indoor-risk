@@ -71,6 +71,26 @@ $ python tools/demo.py --config configs/bisenetv2_city.py --weight-path /path/to
 
 This would run inference on the image and save the result image to `./res.jpg`.  
 
+### Indoor risk: BiSeNet + YOLO single-image inference
+
+The indoor-risk entry point can fuse the trained YOLO detections into the
+existing risk score. On the shared server, run:
+
+```bash
+python tools/demo_indoor_risk.py \
+  --img-path /path/to/test.jpg \
+  --weight-path res_indoor_risk_v2/model_final.pth \
+  --yolo-weight /data/users/jianfei/results/yolo_results/yolov8s_fall_hazard_indoor_v6_extended2/weights/best.pt
+```
+
+`--yolo-weight` may be omitted on that server when the documented checkpoint
+exists, or supplied through `YOLO_WEIGHT_PATH`. The generated feature JSON
+contains every YOLO box, class, confidence, corridor overlap and the fused
+risk score. The risk overlay draws in-corridor YOLO boxes in red and other
+boxes in gray. This repository keeps its original score convention: a higher
+`risk.score` means greater risk (the handoff package's safety score uses the
+opposite direction).
+
 Or you can run inference on a video like this:  
 ```
 $ python tools/demo_video.py --config configs/bisenetv2_coco.py --weight-path res/model_final.pth --input ./video.mp4 --output res.mp4

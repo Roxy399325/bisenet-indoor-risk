@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Extract interpretable indoor-risk features from a BiSeNet mask.
-
-The module deliberately has no dependency on YOLO or a depth model. It
-accepts the integer class-id mask produced by BiSeNet and exposes a stable
-dictionary/JSON contract that those models can extend later.
-"""
+"""Extract and fuse interpretable indoor-risk features from one image."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -52,6 +47,21 @@ _DANGER_CLASSES = (
     CLASS_IDS["slippery_surface"],
     CLASS_IDS["step_threshold"],
 )
+
+# These values follow the YOLO handoff package's ``config/default.json``.
+# They are risk points (higher means more dangerous), not safety deductions.
+YOLO_CLASS_RISK_WEIGHTS = {
+    "shoes_slippers": 8.0,
+    "electric_wire_power": 12.0,
+    "electric_wire": 12.0,
+    "rug_mat_carpet": 10.0,
+    "rug_edge": 10.0,
+    "toy": 8.0,
+    "liquid_spot": 20.0,
+    "door_stairs_threshold": 10.0,
+    "threshold": 10.0,
+}
+YOLO_MIN_CORRIDOR_OVERLAP = 0.05
 
 
 def _json_number(value: Any) -> Any:
@@ -97,6 +107,7 @@ class BisenetAnalysis:
     corridor_mask: np.ndarray = field(repr=False)
     obstacle_mask: np.ndarray = field(repr=False)
     obstacle_instances: List[Dict[str, Any]] = field(default_factory=list)
+    yolo_detections: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -115,6 +126,7 @@ class BisenetAnalysis:
                 {key: _json_number(value) for key, value in instance.items()}
                 for instance in self.obstacle_instances
             ],
+            "yolo_detections": [dict(item) for item in self.yolo_detections],
         }
 
 
@@ -386,14 +398,116 @@ def _risk_level(score: float) -> str:
     return "low"
 
 
-def _score_risk(features: Dict[str, Any], mask_valid: bool) -> RiskResult:
-    obstacle_count = float(features.get("obstacle_count", 0) or 0)
-    obstacle_ratio = float(features.get("obstacle_area_ratio", 0.0) or 0.0)
+def _detection_value(detection: Any, name: str) -> Any:
+    if isinstance(detection, Mapping):
+        if name == "xyxy" and name not in detection:
+            return detection.get("bbox_xyxy")
+        return detection.get(name)
+    return getattr(detection, name, None)
+
+
+def _normalize_yolo_detections(
+    detections: Iterable[Any],
+    shape: Tuple[int, int],
+    corridor: np.ndarray,
+    corridor_valid: bool,
+) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    """Clip YOLO boxes and attach their overlap with the BiSeNet corridor."""
+
+    height, width = shape
+    records: List[Dict[str, Any]] = []
+    occupied = np.zeros(shape, dtype=bool)
+    for detection in detections:
+        coords = _detection_value(detection, "xyxy")
+        if coords is None or len(coords) != 4:
+            raise ValueError("each YOLO detection must provide four xyxy coordinates")
+        try:
+            values = [float(value) for value in coords]
+        except (TypeError, ValueError) as error:
+            raise ValueError("YOLO xyxy coordinates must be numeric") from error
+        if not np.all(np.isfinite(values)):
+            raise ValueError("YOLO xyxy coordinates must be finite")
+        x1, x2 = sorted((int(round(values[0])), int(round(values[2]))))
+        y1, y2 = sorted((int(round(values[1])), int(round(values[3]))))
+        x1, x2 = int(np.clip(x1, 0, width)), int(np.clip(x2, 0, width))
+        y1, y2 = int(np.clip(y1, 0, height)), int(np.clip(y2, 0, height))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        confidence = float(_detection_value(detection, "confidence"))
+        if not np.isfinite(confidence):
+            raise ValueError("YOLO confidence must be finite")
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+        class_id = int(_detection_value(detection, "class_id"))
+        class_name = str(_detection_value(detection, "class_name"))
+        box_area = float((x2 - x1) * (y2 - y1))
+
+        if corridor_valid:
+            local_corridor = corridor[y1:y2, x1:x2]
+            overlap_pixels = int(local_corridor.sum())
+            overlap_ratio: Optional[float] = overlap_pixels / box_area
+            in_corridor: Optional[bool] = (
+                overlap_ratio >= YOLO_MIN_CORRIDOR_OVERLAP
+            )
+            if in_corridor:
+                occupied[y1:y2, x1:x2] |= local_corridor
+        else:
+            overlap_ratio = None
+            in_corridor = None
+
+        records.append(
+            {
+                "bbox_xyxy": [x1, y1, x2, y2],
+                "class_id": class_id,
+                "class_name": class_name,
+                "confidence": confidence,
+                "corridor_overlap_ratio": overlap_ratio,
+                "in_corridor": in_corridor,
+            }
+        )
+    return records, occupied
+
+
+def _yolo_category_risk_points(
+    detections: Sequence[Dict[str, Any]],
+) -> float:
+    points = 0.0
+    for detection in detections:
+        if detection["in_corridor"] is not True:
+            continue
+        class_name = str(detection["class_name"]).split(" (", 1)[0]
+        points += (
+            YOLO_CLASS_RISK_WEIGHTS.get(class_name, 0.0)
+            * float(detection["confidence"])
+        )
+    return float(min(25.0, points))
+
+
+def _score_risk(
+    features: Dict[str, Any],
+    mask_valid: bool,
+    yolo_detections: Sequence[Dict[str, Any]],
+) -> RiskResult:
+    bisenet_obstacle_count = float(features.get("obstacle_count", 0) or 0)
+    yolo_obstacle_count = float(features.get("yolo_corridor_detection_count", 0) or 0)
+    obstacle_count = max(bisenet_obstacle_count, yolo_obstacle_count)
+    bisenet_obstacle_ratio = float(features.get("obstacle_area_ratio", 0.0) or 0.0)
+    yolo_obstacle_ratio = float(features.get("yolo_corridor_occupancy", 0.0) or 0.0)
+    obstacle_ratio = max(bisenet_obstacle_ratio, yolo_obstacle_ratio)
     obstacle_quantity = 0.5 * _clip01(obstacle_count / 5.0) + 0.5 * _clip01(obstacle_ratio / 0.25)
-    obstacle_score = 25.0 * obstacle_quantity
+    generic_obstacle_score = 25.0 * obstacle_quantity
+
+    # A category-specific score strengthens the generic obstacle evidence but
+    # does not stack on top of it, which avoids double-counting one object seen
+    # by both BiSeNet and YOLO.
+    category_score = float(features.get("yolo_category_risk_points", 0.0) or 0.0)
+    obstacle_score = max(generic_obstacle_score, category_score)
 
     corridor_valid = bool(features.get("corridor_valid", False))
-    corridor_occupancy = float(features.get("corridor_obstacle_occupancy", 0.0) or 0.0)
+    corridor_occupancy = max(
+        float(features.get("corridor_obstacle_occupancy", 0.0) or 0.0),
+        float(features.get("yolo_corridor_occupancy", 0.0) or 0.0),
+    )
     corridor_score = 20.0 * _clip01(corridor_occupancy / 0.35) if corridor_valid else 0.0
 
     width_ratio = features.get("narrowest_passage_width_ratio")
@@ -431,8 +545,22 @@ def _score_risk(features: Dict[str, Any], mask_valid: bool) -> RiskResult:
     suggestions: List[str] = []
 
     if obstacle_count > 0:
-        reasons.append("检测到{}个疑似障碍物。".format(int(obstacle_count)))
+        reasons.append("检测到{}个疑似通行障碍物。".format(int(obstacle_count)))
         suggestions.append("清理或移除通道及活动区域内的障碍物。")
+    corridor_yolo = [
+        item for item in yolo_detections if item["in_corridor"] is True
+    ]
+    if corridor_yolo:
+        category_counts: Dict[str, int] = {}
+        for item in corridor_yolo:
+            name = str(item["class_name"])
+            category_counts[name] = category_counts.get(name, 0) + 1
+        summary = "、".join(
+            "{}×{}".format(name, count)
+            for name, count in sorted(category_counts.items())
+        )
+        reasons.append("YOLO在通道代理区域检测到：{}。".format(summary))
+        suggestions.append("优先清理或固定YOLO识别出的具体障碍物。")
     if corridor_valid and corridor_occupancy >= 0.05:
         reasons.append("通道代理区域存在障碍物占用。")
     if width_ratio is not None and corridor_valid and float(width_ratio) < 0.25:
@@ -474,10 +602,11 @@ def analyze_bisenet(
     image: np.ndarray,
     mask: np.ndarray,
     *,
+    yolo_detections: Optional[Iterable[Any]] = None,
     min_component_area: Optional[int] = None,
     min_valid_pixel_ratio: float = 0.80,
 ) -> BisenetAnalysis:
-    """Extract features and calculate rule-based risk from a class-id mask."""
+    """Extract features and fuse optional YOLO detections into the risk score."""
 
     height, width = _validate_inputs(image, mask)
     mask = mask.astype(np.uint8, copy=False)
@@ -548,7 +677,20 @@ def analyze_bisenet(
         corridor_mask,
         corridor_valid,
     )
+    yolo_available = yolo_detections is not None
+    normalized_yolo, yolo_occupied = _normalize_yolo_detections(
+        [] if yolo_detections is None else yolo_detections,
+        (height, width),
+        corridor_mask,
+        corridor_valid,
+    )
     full_obstacle_pixels = int(obstacle_mask.sum())
+
+    yolo_class_counts: Dict[str, int] = {}
+    for detection in normalized_yolo:
+        if detection["in_corridor"] is True:
+            name = str(detection["class_name"])
+            yolo_class_counts[name] = yolo_class_counts.get(name, 0) + 1
 
     features.update(
         {
@@ -582,6 +724,25 @@ def analyze_bisenet(
             )
             if corridor_valid
             else None,
+            "yolo_detection_count": int(len(normalized_yolo))
+            if yolo_available
+            else None,
+            "yolo_corridor_detection_count": int(
+                sum(item["in_corridor"] is True for item in normalized_yolo)
+            )
+            if yolo_available and corridor_valid
+            else None,
+            "yolo_corridor_occupancy": float(
+                yolo_occupied.sum() / corridor_denominator
+            )
+            if yolo_available and corridor_valid
+            else None,
+            "yolo_class_counts": yolo_class_counts if yolo_available else None,
+            "yolo_category_risk_points": _yolo_category_risk_points(
+                normalized_yolo
+            )
+            if yolo_available and corridor_valid
+            else None,
         }
     )
     global_slippery_ratio = float(features["slippery_surface_area_ratio"])
@@ -614,7 +775,7 @@ def analyze_bisenet(
 
     light_roi = corridor_mask if corridor_valid else None
     features.update(_low_light_features(image, light_roi))
-    risk = _score_risk(features, mask_valid)
+    risk = _score_risk(features, mask_valid, normalized_yolo)
 
     quality = {
         "valid_pixel_ratio": features["valid_pixel_ratio"],
@@ -625,7 +786,9 @@ def analyze_bisenet(
         "corridor_fallback_used": bool(corridor_fallback),
         "step_threshold_reliability": "low",
         "slippery_surface_reliability": "medium",
-        "specific_obstacle_categories_available": False,
+        "specific_obstacle_categories_available": bool(yolo_available),
+        "yolo_corridor_overlap_threshold": float(YOLO_MIN_CORRIDOR_OVERLAP),
+        "yolo_scoring_method": "max_with_bisenet_obstacle_score",
         "obstacle_count_semantics": "connected_regions_not_object_instances",
         "low_light_method": "corridor_or_lower_frame_heuristic",
         "absolute_metric_scale_available": False,
@@ -638,8 +801,9 @@ def analyze_bisenet(
     unavailable = [
         "depth_change_score",
         "narrowest_passage_width_m",
-        "specific_obstacle_categories",
     ]
+    if not yolo_available:
+        unavailable.append("specific_obstacle_categories")
     unavailable.extend(
         key for key, value in features.items() if value is None and key not in unavailable
     )
@@ -655,6 +819,7 @@ def analyze_bisenet(
         corridor_mask=corridor_mask,
         obstacle_mask=obstacle_mask,
         obstacle_instances=obstacle_components,
+        yolo_detections=normalized_yolo,
     )
 
 
@@ -715,13 +880,50 @@ def render_analysis_overlay(
     )
     cv2.drawContours(overlay, corridor_contours, -1, (255, 190, 0), 2)
 
+    for detection in analysis.yolo_detections:
+        x1, y1, x2, y2 = detection["bbox_xyxy"]
+        in_corridor = detection["in_corridor"]
+        color = (0, 0, 255) if in_corridor is True else (160, 160, 160)
+        cv2.rectangle(overlay, (x1, y1), (max(x1, x2 - 1), max(y1, y2 - 1)), color, 2)
+        label = "{} {:.0%}".format(
+            detection["class_name"], float(detection["confidence"])
+        )
+        cv2.putText(
+            overlay,
+            label,
+            (x1, max(16, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            label,
+            (x1, max(16, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
     width_ratio = analysis.features.get("narrowest_passage_width_ratio")
     width_text = "N/A" if width_ratio is None else "{:.1%}".format(width_ratio)
+    obstacle_count = max(
+        int(analysis.features.get("obstacle_count", 0) or 0),
+        int(analysis.features.get("yolo_corridor_detection_count", 0) or 0),
+    )
+    corridor_occupancy = max(
+        float(analysis.features.get("corridor_obstacle_occupancy", 0.0) or 0.0),
+        float(analysis.features.get("yolo_corridor_occupancy", 0.0) or 0.0),
+    )
     lines = [
         "Risk: {} ({:.1f}/100)".format(analysis.risk.level, analysis.risk.score),
         "Obstacles: {} | Corridor occupancy: {:.1%}".format(
-            analysis.features.get("obstacle_count", 0),
-            float(analysis.features.get("corridor_obstacle_occupancy", 0.0) or 0.0),
+            obstacle_count,
+            corridor_occupancy,
         ),
         "Narrow width: {}".format(width_text),
     ]

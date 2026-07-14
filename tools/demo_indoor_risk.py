@@ -31,12 +31,24 @@ from lib.risk.bisenet_features import (
     analyze_bisenet,
     render_analysis_overlay,
 )
+from lib.risk.yolo import UltralyticsYoloAdapter
 
 
 DEFAULT_CLASS_NAMES = list(CLASS_NAMES)
 
 INDOOR_RISK_MEAN = (0.52594033, 0.46734318, 0.41189465)
 INDOOR_RISK_STD = (0.24811083, 0.24959911, 0.25970083)
+SERVER_YOLO_WEIGHT = (
+    '/data/users/jianfei/results/yolo_results/'
+    'yolov8s_fall_hazard_indoor_v6_extended2/weights/best.pt'
+)
+
+
+def default_yolo_weight():
+    configured = os.environ.get('YOLO_WEIGHT_PATH')
+    if configured:
+        return configured
+    return SERVER_YOLO_WEIGHT if osp.isfile(SERVER_YOLO_WEIGHT) else None
 
 
 def parse_args():
@@ -60,6 +72,22 @@ def parse_args():
     parser.add_argument('--mask-output', help='Raw uint8 class-id mask output path.')
     parser.add_argument('--features-output', help='JSON feature and risk output path.')
     parser.add_argument('--analysis-output', help='Risk overlay output path.')
+    parser.add_argument(
+        '--yolo-weight', '--yolo', dest='yolo_weight',
+        default=default_yolo_weight(),
+        help=(
+            'Optional trained YOLO .pt checkpoint. Defaults to YOLO_WEIGHT_PATH '
+            'or the documented /data/users/jianfei checkpoint when available.'
+        ),
+    )
+    parser.add_argument('--yolo-confidence', type=float, default=0.25,
+                        help='Minimum YOLO detection confidence (default: 0.25).')
+    parser.add_argument('--yolo-iou', type=float, default=0.70,
+                        help='YOLO NMS IoU threshold (default: 0.70).')
+    parser.add_argument(
+        '--yolo-device',
+        help='Ultralytics device, for example 0, 1, or cpu. Defaults to BiSeNet device.',
+    )
     return parser.parse_args()
 
 
@@ -264,7 +292,32 @@ def main():
 
     # Keep the colour comparison above for human inspection, but pass the
     # original integer prediction to the machine-readable risk pipeline.
-    analysis = analyze_bisenet(image, prediction)
+    yolo_detections = None
+    yolo_elapsed_ms = None
+    if args.yolo_weight:
+        yolo_weight = resolve_project_path(args.yolo_weight)
+        yolo_device = args.yolo_device
+        if yolo_device is None:
+            yolo_device = '0' if device.type == 'cuda' else 'cpu'
+        yolo = UltralyticsYoloAdapter(
+            yolo_weight,
+            device=yolo_device,
+            confidence=args.yolo_confidence,
+            iou=args.yolo_iou,
+        )
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        yolo_start = time.perf_counter()
+        yolo_detections = yolo.predict(image)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        yolo_elapsed_ms = (time.perf_counter() - yolo_start) * 1000
+
+    analysis = analyze_bisenet(
+        image,
+        prediction,
+        yolo_detections=yolo_detections,
+    )
     sample_stem = osp.splitext(osp.basename(img_path))[0]
     analysis_dir = osp.join(cfg.respth, 'analysis')
     mask_output = args.mask_output or osp.join(analysis_dir, '{}_mask.png'.format(sample_stem))
@@ -290,6 +343,9 @@ def main():
     print('Model device: {}'.format(device))
     print('Input image: {}'.format(img_path))
     print('Inference time: {:.2f} ms'.format(elapsed_ms))
+    if yolo_elapsed_ms is not None:
+        print('YOLO inference time: {:.2f} ms'.format(yolo_elapsed_ms))
+        print('YOLO detections: {}'.format(len(yolo_detections)))
     print('Saved comparison: {}'.format(output_path))
     print('Saved raw mask: {}'.format(mask_output))
     print('Saved features: {}'.format(features_output))

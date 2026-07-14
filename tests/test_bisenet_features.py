@@ -16,6 +16,7 @@ from lib.risk.bisenet_features import (
     analyze_bisenet,
     render_analysis_overlay,
 )
+from lib.risk.yolo import YoloDetection
 
 
 class BisenetFeatureTests(unittest.TestCase):
@@ -144,6 +145,56 @@ class BisenetFeatureTests(unittest.TestCase):
         self.assertIn('features', payload)
         self.assertIn('risk', payload)
         self.assertIn('obstacles', payload)
+
+    def test_yolo_detection_in_corridor_increases_risk_and_is_serialized(self):
+        mask = np.zeros((100, 120), dtype=np.uint8)
+        baseline = analyze_bisenet(self.image, mask)
+        detection = YoloDetection(
+            xyxy=(48, 55, 72, 90),
+            class_id=1,
+            class_name='electric_wire_power',
+            confidence=0.8,
+        )
+
+        result = analyze_bisenet(
+            self.image,
+            mask,
+            yolo_detections=[detection],
+        )
+        payload = result.to_dict()
+
+        self.assertEqual(result.features['yolo_detection_count'], 1)
+        self.assertEqual(result.features['yolo_corridor_detection_count'], 1)
+        self.assertGreater(result.features['yolo_corridor_occupancy'], 0.0)
+        self.assertAlmostEqual(result.features['yolo_category_risk_points'], 9.6)
+        self.assertGreater(result.risk.score, baseline.risk.score)
+        self.assertTrue(result.quality['specific_obstacle_categories_available'])
+        self.assertTrue(payload['yolo_detections'][0]['in_corridor'])
+        self.assertTrue(
+            any('electric_wire_power' in reason for reason in result.risk.reasons)
+        )
+        json.dumps(payload, ensure_ascii=False)
+
+    def test_yolo_detection_outside_corridor_is_reported_but_not_scored(self):
+        mask = np.zeros((100, 120), dtype=np.uint8)
+        detection = YoloDetection(
+            xyxy=(0, 55, 10, 90),
+            class_id=6,
+            class_name='toy',
+            confidence=1.0,
+        )
+
+        result = analyze_bisenet(
+            self.image,
+            mask,
+            yolo_detections=[detection],
+        )
+
+        self.assertEqual(result.features['yolo_detection_count'], 1)
+        self.assertEqual(result.features['yolo_corridor_detection_count'], 0)
+        self.assertEqual(result.features['yolo_corridor_occupancy'], 0.0)
+        self.assertFalse(result.yolo_detections[0]['in_corridor'])
+        self.assertEqual(result.risk.level, 'low')
 
     def test_invalid_mask_class_is_rejected(self):
         mask = np.zeros((100, 120), dtype=np.uint8)
