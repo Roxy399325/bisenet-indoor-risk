@@ -50,6 +50,8 @@ _DANGER_CLASSES = (
 
 # These values follow the YOLO handoff package's ``config/default.json``.
 # They are risk points (higher means more dangerous), not safety deductions.
+# ``liquid_spot`` is intentionally absent in V2 because it is fused into the
+# slippery component instead of being counted again as a passage category.
 YOLO_CLASS_RISK_WEIGHTS = {
     "shoes_slippers": 8.0,
     "electric_wire_power": 12.0,
@@ -57,11 +59,28 @@ YOLO_CLASS_RISK_WEIGHTS = {
     "rug_mat_carpet": 10.0,
     "rug_edge": 10.0,
     "toy": 8.0,
-    "liquid_spot": 20.0,
     "door_stairs_threshold": 10.0,
     "threshold": 10.0,
 }
 YOLO_MIN_CORRIDOR_OVERLAP = 0.05
+
+# V2 groups three correlated passage signals under one cap so a single item of
+# furniture cannot independently saturate obstacle, occupancy, and width risk.
+RISK_SCORING_VERSION = "v2_evidence_aware"
+RISK_COMPONENT_MAX_POINTS = {
+    "passage_obstruction": 45.0,
+    "steps_thresholds": 25.0,
+    "slippery_surface": 20.0,
+    "low_light": 10.0,
+}
+PASSAGE_EVIDENCE_WEIGHTS = {
+    "obstacles": 0.35,
+    "corridor_occupancy": 0.40,
+    "narrow_passage": 0.25,
+}
+CARPET_SLIPPERY_RELIABILITY_FACTOR = 0.25
+_CARPET_YOLO_CLASSES = frozenset(("rug_mat_carpet", "rug_edge"))
+_LIQUID_YOLO_CLASSES = frozenset(("liquid_spot",))
 
 
 def _json_number(value: Any) -> Any:
@@ -76,6 +95,7 @@ class RiskResult:
 
     score: float
     level: str
+    scoring_version: str = RISK_SCORING_VERSION
     reasons: List[str] = field(default_factory=list)
     suggestions: List[str] = field(default_factory=list)
     component_scores: Dict[str, float] = field(default_factory=dict)
@@ -84,6 +104,7 @@ class RiskResult:
         return {
             "score": float(self.score),
             "level": self.level,
+            "scoring_version": self.scoring_version,
             "reasons": list(self.reasons),
             "suggestions": list(self.suggestions),
             "component_scores": {
@@ -468,6 +489,10 @@ def _normalize_yolo_detections(
     return records, occupied
 
 
+def _base_yolo_class_name(detection: Mapping[str, Any]) -> str:
+    return str(detection["class_name"]).split(" (", 1)[0]
+
+
 def _yolo_category_risk_points(
     detections: Sequence[Dict[str, Any]],
 ) -> float:
@@ -475,7 +500,7 @@ def _yolo_category_risk_points(
     for detection in detections:
         if detection["in_corridor"] is not True:
             continue
-        class_name = str(detection["class_name"]).split(" (", 1)[0]
+        class_name = _base_yolo_class_name(detection)
         points += (
             YOLO_CLASS_RISK_WEIGHTS.get(class_name, 0.0)
             * float(detection["confidence"])
@@ -494,7 +519,10 @@ def _score_risk(
     bisenet_obstacle_ratio = float(features.get("obstacle_area_ratio", 0.0) or 0.0)
     yolo_obstacle_ratio = float(features.get("yolo_corridor_occupancy", 0.0) or 0.0)
     obstacle_ratio = max(bisenet_obstacle_ratio, yolo_obstacle_ratio)
-    obstacle_quantity = 0.5 * _clip01(obstacle_count / 5.0) + 0.5 * _clip01(obstacle_ratio / 0.25)
+    obstacle_quantity = (
+        0.5 * _clip01(obstacle_count / 5.0)
+        + 0.5 * _clip01(obstacle_ratio / 0.25)
+    )
     generic_obstacle_score = 25.0 * obstacle_quantity
 
     # A category-specific score strengthens the generic obstacle evidence but
@@ -516,19 +544,79 @@ def _score_risk(
     else:
         width_score = 20.0 * _clip01((0.40 - float(width_ratio)) / 0.30)
 
+    passage_evidence = (
+        PASSAGE_EVIDENCE_WEIGHTS["obstacles"] * _clip01(obstacle_score / 25.0)
+        + PASSAGE_EVIDENCE_WEIGHTS["corridor_occupancy"]
+        * _clip01(corridor_score / 20.0)
+        + PASSAGE_EVIDENCE_WEIGHTS["narrow_passage"]
+        * _clip01(width_score / 20.0)
+    )
+    passage_score = (
+        RISK_COMPONENT_MAX_POINTS["passage_obstruction"]
+        * _clip01(passage_evidence)
+    )
+
     step_count = float(features.get("step_threshold_count", 0) or 0)
     step_ratio = float(features.get("step_threshold_area_ratio", 0.0) or 0.0)
-    step_score = 20.0 * max(_clip01(step_count / 3.0), _clip01(step_ratio / 0.05))
+    step_evidence = max(
+        _clip01(step_count / 3.0),
+        _clip01(step_ratio / 0.05),
+    )
+    step_score = RISK_COMPONENT_MAX_POINTS["steps_thresholds"] * step_evidence
 
     slippery_ratio = float(features.get("corridor_slippery_ratio", 0.0) or 0.0)
-    slippery_evidence = float(features.get("slippery_surface_score", 0.0) or 0.0)
-    slippery_score = 10.0 * _clip01(slippery_evidence)
-    low_light_score = 5.0 * _clip01(float(features.get("low_light_score", 0.0) or 0.0))
+    raw_slippery_evidence = _clip01(
+        float(features.get("slippery_surface_score", 0.0) or 0.0)
+    )
+    corridor_classes = {
+        _base_yolo_class_name(item)
+        for item in yolo_detections
+        if item["in_corridor"] is True
+    }
+    carpet_present = bool(corridor_classes & _CARPET_YOLO_CLASSES)
+    liquid_confidence = max(
+        (
+            float(item["confidence"])
+            for item in yolo_detections
+            if item["in_corridor"] is True
+            and _base_yolo_class_name(item) in _LIQUID_YOLO_CLASSES
+        ),
+        default=0.0,
+    )
+    carpet_discount_applied = carpet_present and liquid_confidence <= 0.0
+    slippery_reliability_factor = (
+        CARPET_SLIPPERY_RELIABILITY_FACTOR
+        if carpet_discount_applied
+        else 1.0
+    )
+    slippery_evidence = max(raw_slippery_evidence, _clip01(liquid_confidence))
+    slippery_evidence *= slippery_reliability_factor
+    slippery_score = (
+        RISK_COMPONENT_MAX_POINTS["slippery_surface"]
+        * _clip01(slippery_evidence)
+    )
+    low_light_evidence = _clip01(
+        float(features.get("low_light_score", 0.0) or 0.0)
+    )
+    low_light_score = RISK_COMPONENT_MAX_POINTS["low_light"] * low_light_evidence
+
+    features.update(
+        {
+            "scoring_version": RISK_SCORING_VERSION,
+            "passage_obstruction_evidence": float(passage_evidence),
+            "slippery_surface_raw_evidence": float(raw_slippery_evidence),
+            "slippery_surface_reliability_factor": float(
+                slippery_reliability_factor
+            ),
+            "slippery_surface_carpet_discount_applied": bool(
+                carpet_discount_applied
+            ),
+            "yolo_liquid_spot_confidence": float(liquid_confidence),
+        }
+    )
 
     component_scores = {
-        "obstacles": obstacle_score,
-        "corridor_occupancy": corridor_score,
-        "narrow_passage": width_score,
+        "passage_obstruction": passage_score,
         "steps_thresholds": step_score,
         "slippery_surface": slippery_score,
         "low_light": low_light_score,
@@ -540,7 +628,7 @@ def _score_risk(
         else 0.0
     )
     component_scores["observability_penalty"] = observability_penalty
-    score = float(round(sum(component_scores.values()), 2))
+    score = float(round(min(100.0, sum(component_scores.values())), 2))
     reasons: List[str] = []
     suggestions: List[str] = []
 
@@ -569,9 +657,16 @@ def _score_risk(
     if step_count > 0:
         reasons.append("检测到{}个疑似台阶或门槛区域，结果仅供提示。".format(int(step_count)))
         suggestions.append("检查台阶或门槛，并增加醒目标识、扶手或坡道。")
-    if corridor_valid and slippery_ratio >= 0.02:
-        reasons.append("通道代理区域存在疑似湿滑表面。")
-        suggestions.append("及时清洁并干燥地面，必要时增加防滑措施。")
+    if corridor_valid and (slippery_ratio >= 0.02 or liquid_confidence > 0.0):
+        if carpet_discount_applied:
+            reasons.append(
+                "检测到疑似湿滑区域，但与通道内地毯证据同时出现，"
+                "已降低该项评分可信度。"
+            )
+            suggestions.append("检查地毯是否平整、固定和干燥，并复核周边地面。")
+        else:
+            reasons.append("通道代理区域存在疑似湿滑表面。")
+            suggestions.append("及时清洁并干燥地面，必要时增加防滑措施。")
     if bool(features.get("low_light_flag", False)):
         reasons.append("图像存在低光照风险。")
         suggestions.append("增加室内照明或配置夜间感应灯。")
@@ -592,6 +687,7 @@ def _score_risk(
     return RiskResult(
         score=score,
         level=level,
+        scoring_version=RISK_SCORING_VERSION,
         reasons=reasons,
         suggestions=list(dict.fromkeys(suggestions)),
         component_scores=component_scores,
@@ -786,9 +882,16 @@ def analyze_bisenet(
         "corridor_fallback_used": bool(corridor_fallback),
         "step_threshold_reliability": "low",
         "slippery_surface_reliability": "medium",
+        "risk_scoring_version": RISK_SCORING_VERSION,
+        "risk_component_max_points": dict(RISK_COMPONENT_MAX_POINTS),
+        "passage_scoring_method": "weighted_composite_capped_at_45",
+        "passage_evidence_weights": dict(PASSAGE_EVIDENCE_WEIGHTS),
+        "slippery_carpet_discount_factor": float(
+            CARPET_SLIPPERY_RELIABILITY_FACTOR
+        ),
         "specific_obstacle_categories_available": bool(yolo_available),
         "yolo_corridor_overlap_threshold": float(YOLO_MIN_CORRIDOR_OVERLAP),
-        "yolo_scoring_method": "max_with_bisenet_obstacle_score",
+        "yolo_scoring_method": "max_evidence_inside_passage_composite",
         "obstacle_count_semantics": "connected_regions_not_object_instances",
         "low_light_method": "corridor_or_lower_frame_heuristic",
         "absolute_metric_scale_available": False,

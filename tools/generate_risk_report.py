@@ -144,6 +144,7 @@ def build_report_payload(source: Dict[str, Any], image_id: str) -> Dict[str, Any
         "source_risk": {
             "score": risk.get("score"),
             "level": risk.get("level"),
+            "scoring_version": risk.get("scoring_version"),
             "reasons": risk.get("reasons", []),
             "suggestions": risk.get("suggestions", []),
             "component_scores": risk.get("component_scores", {}),

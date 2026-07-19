@@ -100,7 +100,91 @@ class BisenetFeatureTests(unittest.TestCase):
         self.assertEqual(result.features['step_threshold_count'], 1)
         self.assertTrue(result.features['low_light_flag'])
         self.assertIn('low_light', result.risk.component_scores)
+        self.assertIn('passage_obstruction', result.risk.component_scores)
         self.assertTrue(result.risk.suggestions)
+
+    def test_correlated_passage_signals_share_one_component_cap(self):
+        mask = np.zeros((100, 120), dtype=np.uint8)
+        mask[40:95, 35:85] = 3
+        detection = YoloDetection(
+            xyxy=(35, 45, 85, 95),
+            class_id=7,
+            class_name='chair_stool',
+            confidence=1.0,
+        )
+
+        result = analyze_bisenet(
+            self.image,
+            mask,
+            yolo_detections=[detection],
+        )
+
+        components = result.risk.component_scores
+        self.assertLessEqual(components['passage_obstruction'], 45.0)
+        self.assertNotIn('obstacles', components)
+        self.assertNotIn('corridor_occupancy', components)
+        self.assertNotIn('narrow_passage', components)
+        self.assertEqual(result.risk.scoring_version, 'v2_evidence_aware')
+
+    def test_carpet_discount_reduces_ambiguous_slippery_evidence(self):
+        mask = np.zeros((100, 120), dtype=np.uint8)
+        mask[55:85, 40:80] = 4
+        baseline = analyze_bisenet(self.image, mask)
+        carpet = YoloDetection(
+            xyxy=(38, 52, 82, 90),
+            class_id=5,
+            class_name='rug_mat_carpet',
+            confidence=0.9,
+        )
+
+        result = analyze_bisenet(
+            self.image,
+            mask,
+            yolo_detections=[carpet],
+        )
+
+        self.assertTrue(
+            result.features['slippery_surface_carpet_discount_applied']
+        )
+        self.assertAlmostEqual(
+            result.features['slippery_surface_reliability_factor'],
+            0.25,
+        )
+        self.assertLess(
+            result.risk.component_scores['slippery_surface'],
+            baseline.risk.component_scores['slippery_surface'],
+        )
+        self.assertTrue(
+            any('地毯证据' in reason for reason in result.risk.reasons)
+        )
+
+    def test_liquid_detection_is_fused_into_slippery_component(self):
+        mask = np.zeros((100, 120), dtype=np.uint8)
+        liquid = YoloDetection(
+            xyxy=(48, 55, 72, 90),
+            class_id=4,
+            class_name='liquid_spot',
+            confidence=0.8,
+        )
+
+        result = analyze_bisenet(
+            self.image,
+            mask,
+            yolo_detections=[liquid],
+        )
+
+        self.assertFalse(
+            result.features['slippery_surface_carpet_discount_applied']
+        )
+        self.assertAlmostEqual(
+            result.features['yolo_liquid_spot_confidence'],
+            0.8,
+        )
+        self.assertAlmostEqual(
+            result.risk.component_scores['slippery_surface'],
+            16.0,
+        )
+        self.assertEqual(result.features['yolo_category_risk_points'], 0.0)
 
     def test_all_ignore_is_not_reported_as_low_risk(self):
         mask = np.full((100, 120), 255, dtype=np.uint8)
@@ -145,6 +229,11 @@ class BisenetFeatureTests(unittest.TestCase):
         self.assertIn('features', payload)
         self.assertIn('risk', payload)
         self.assertIn('obstacles', payload)
+        self.assertEqual(payload['risk']['scoring_version'], 'v2_evidence_aware')
+        self.assertEqual(
+            sum(payload['quality']['risk_component_max_points'].values()),
+            100.0,
+        )
 
     def test_yolo_detection_in_corridor_increases_risk_and_is_serialized(self):
         mask = np.zeros((100, 120), dtype=np.uint8)
