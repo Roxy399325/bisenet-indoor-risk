@@ -512,7 +512,27 @@ def _score_risk(
     features: Dict[str, Any],
     mask_valid: bool,
     yolo_detections: Sequence[Dict[str, Any]],
+    component_max_points: Optional[Mapping[str, float]] = None,
 ) -> RiskResult:
+    max_points = dict(RISK_COMPONENT_MAX_POINTS)
+    if component_max_points is not None:
+        provided_keys = set(component_max_points)
+        expected_keys = set(RISK_COMPONENT_MAX_POINTS)
+        if provided_keys != expected_keys:
+            raise ValueError(
+                "risk component keys do not match: expected {}, got {}".format(
+                    sorted(expected_keys), sorted(provided_keys)
+                )
+            )
+        max_points = {
+            key: float(component_max_points[key])
+            for key in RISK_COMPONENT_MAX_POINTS
+        }
+        if any(
+            not np.isfinite(value) or value < 0.0
+            for value in max_points.values()
+        ):
+            raise ValueError("risk component max points must be finite and non-negative")
     bisenet_obstacle_count = float(features.get("obstacle_count", 0) or 0)
     yolo_obstacle_count = float(features.get("yolo_corridor_detection_count", 0) or 0)
     obstacle_count = max(bisenet_obstacle_count, yolo_obstacle_count)
@@ -552,7 +572,7 @@ def _score_risk(
         * _clip01(width_score / 20.0)
     )
     passage_score = (
-        RISK_COMPONENT_MAX_POINTS["passage_obstruction"]
+        max_points["passage_obstruction"]
         * _clip01(passage_evidence)
     )
 
@@ -562,7 +582,7 @@ def _score_risk(
         _clip01(step_count / 3.0),
         _clip01(step_ratio / 0.05),
     )
-    step_score = RISK_COMPONENT_MAX_POINTS["steps_thresholds"] * step_evidence
+    step_score = max_points["steps_thresholds"] * step_evidence
 
     slippery_ratio = float(features.get("corridor_slippery_ratio", 0.0) or 0.0)
     raw_slippery_evidence = _clip01(
@@ -592,13 +612,13 @@ def _score_risk(
     slippery_evidence = max(raw_slippery_evidence, _clip01(liquid_confidence))
     slippery_evidence *= slippery_reliability_factor
     slippery_score = (
-        RISK_COMPONENT_MAX_POINTS["slippery_surface"]
+        max_points["slippery_surface"]
         * _clip01(slippery_evidence)
     )
     low_light_evidence = _clip01(
         float(features.get("low_light_score", 0.0) or 0.0)
     )
-    low_light_score = RISK_COMPONENT_MAX_POINTS["low_light"] * low_light_evidence
+    low_light_score = max_points["low_light"] * low_light_evidence
 
     features.update(
         {
@@ -701,6 +721,7 @@ def analyze_bisenet(
     yolo_detections: Optional[Iterable[Any]] = None,
     min_component_area: Optional[int] = None,
     min_valid_pixel_ratio: float = 0.80,
+    risk_component_max_points: Optional[Mapping[str, float]] = None,
 ) -> BisenetAnalysis:
     """Extract features and fuse optional YOLO detections into the risk score."""
 
@@ -871,7 +892,21 @@ def analyze_bisenet(
 
     light_roi = corridor_mask if corridor_valid else None
     features.update(_low_light_features(image, light_roi))
-    risk = _score_risk(features, mask_valid, normalized_yolo)
+    risk = _score_risk(
+        features,
+        mask_valid,
+        normalized_yolo,
+        component_max_points=risk_component_max_points,
+    )
+    selected_component_max_points = (
+        RISK_COMPONENT_MAX_POINTS
+        if risk_component_max_points is None
+        else risk_component_max_points
+    )
+    effective_component_max_points = {
+        key: float(value)
+        for key, value in selected_component_max_points.items()
+    }
 
     quality = {
         "valid_pixel_ratio": features["valid_pixel_ratio"],
@@ -883,7 +918,10 @@ def analyze_bisenet(
         "step_threshold_reliability": "low",
         "slippery_surface_reliability": "medium",
         "risk_scoring_version": RISK_SCORING_VERSION,
-        "risk_component_max_points": dict(RISK_COMPONENT_MAX_POINTS),
+        "risk_component_max_points": effective_component_max_points,
+        "risk_component_weights_overridden": bool(
+            risk_component_max_points is not None
+        ),
         "passage_scoring_method": "weighted_composite_capped_at_45",
         "passage_evidence_weights": dict(PASSAGE_EVIDENCE_WEIGHTS),
         "slippery_carpet_discount_factor": float(
